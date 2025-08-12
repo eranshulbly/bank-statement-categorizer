@@ -232,35 +232,124 @@ const BankStatementCategorizer = () => {
       const worksheet = workbook.Sheets[workbook.SheetNames[0]];
       const jsonData = XLSX.utils.sheet_to_json(worksheet, { header: 1 });
 
-      // Find header row (typically contains 'Date', 'Narration', etc.)
+      // Generic header detection for different bank formats
       let headerRow = -1;
+      let columnMapping = {};
+
+      // Look for headers in first 50 rows
       for (let i = 0; i < Math.min(50, jsonData.length); i++) {
         if (jsonData[i] && jsonData[i].length > 3) {
-          const rowStr = jsonData[i].join(' ').toLowerCase();
-          if ((rowStr.includes('date') || rowStr.includes('dt')) &&
-              (rowStr.includes('narration') || rowStr.includes('description') || rowStr.includes('particulars'))) {
+          const row = jsonData[i];
+          const rowStr = row.join(' ').toLowerCase();
+
+          // Check for different header patterns
+          if (headerRow === -1 && (
+            // Pattern 1: HDFC format (Date, Narration, Withdrawal Amt, Deposit Amt)
+            (rowStr.includes('date') && rowStr.includes('narration') && (rowStr.includes('withdrawal') || rowStr.includes('debit'))) ||
+            // Pattern 2: Axis format (Tran Date, Particulars, DR, CR)
+            (rowStr.includes('tran date') && rowStr.includes('particulars') && rowStr.includes('dr') && rowStr.includes('cr')) ||
+            // Pattern 3: Generic format
+            (rowStr.includes('date') && rowStr.includes('description') && (rowStr.includes('amount') || rowStr.includes('debit') || rowStr.includes('credit')))
+          )) {
             headerRow = i;
+
+            // Map columns based on header content
+            for (let j = 0; j < row.length; j++) {
+              const header = (row[j] || '').toString().toLowerCase();
+
+              // Date column
+              if (header.includes('date') || header.includes('dt')) {
+                columnMapping.date = j;
+              }
+              // Description/Narration/Particulars column
+              else if (header.includes('narration') || header.includes('description') ||
+                       header.includes('particulars') || header.includes('details')) {
+                columnMapping.description = j;
+              }
+              // Withdrawal/Debit column
+              else if (header.includes('withdrawal') || header.includes('debit') || header.includes('dr')) {
+                columnMapping.withdrawal = j;
+              }
+              // Deposit/Credit column
+              else if (header.includes('deposit') || header.includes('credit') || header.includes('cr')) {
+                columnMapping.deposit = j;
+              }
+              // Balance column
+              else if (header.includes('balance') || header.includes('bal')) {
+                columnMapping.balance = j;
+              }
+              // Reference/Check number
+              else if (header.includes('ref') || header.includes('chq') || header.includes('check')) {
+                columnMapping.reference = j;
+              }
+            }
+
+            console.log(`Found header at row ${i + 1}:`, row);
+            console.log('Column mapping:', columnMapping);
             break;
           }
         }
       }
 
       if (headerRow === -1) {
-        throw new Error('Could not find header row in the statement');
+        throw new Error('Could not find header row in the statement. Please ensure your file contains standard bank statement headers.');
+      }
+
+      // Validate essential columns
+      if (columnMapping.date === undefined || columnMapping.description === undefined) {
+        throw new Error('Missing essential columns (Date and Description/Narration/Particulars). Please check your file format.');
+      }
+
+      // If no separate DR/CR columns, look for a single Amount column
+      if (columnMapping.withdrawal === undefined && columnMapping.deposit === undefined) {
+        for (let j = 0; j < jsonData[headerRow].length; j++) {
+          const header = (jsonData[headerRow][j] || '').toString().toLowerCase();
+          if (header.includes('amount')) {
+            columnMapping.amount = j;
+            break;
+          }
+        }
       }
 
       // First pass: Collect all transactions and identify refund pairs
       const transactions = [];
       for (let i = headerRow + 1; i < jsonData.length; i++) {
-        if (jsonData[i] && jsonData[i].length > 0) {
+        if (jsonData[i] && jsonData[i].length > Math.max(columnMapping.date, columnMapping.description)) {
           const row = jsonData[i];
-          const withdrawalAmount = row[4] ? parseFloat(row[4]) : 0;
-          const depositAmount = row[5] ? parseFloat(row[5]) : 0;
 
-          if (withdrawalAmount > 0 || depositAmount > 0) {
+          // Extract transaction data based on column mapping
+          const date = row[columnMapping.date];
+          const description = row[columnMapping.description] || '';
+
+          let withdrawalAmount = 0;
+          let depositAmount = 0;
+
+          // Handle different amount column structures
+          if (columnMapping.withdrawal !== undefined && columnMapping.deposit !== undefined) {
+            // Separate DR/CR columns
+            const drStr = (row[columnMapping.withdrawal] || '').toString().trim();
+            const crStr = (row[columnMapping.deposit] || '').toString().trim();
+
+            withdrawalAmount = drStr && drStr !== '' && drStr !== ' ' ? parseFloat(drStr.replace(/,/g, '')) || 0 : 0;
+            depositAmount = crStr && crStr !== '' && crStr !== ' ' ? parseFloat(crStr.replace(/,/g, '')) || 0 : 0;
+          } else if (columnMapping.amount !== undefined) {
+            // Single amount column - determine if positive or negative
+            const amountStr = (row[columnMapping.amount] || '').toString().trim();
+            const amount = parseFloat(amountStr.replace(/,/g, '')) || 0;
+
+            if (amount > 0) {
+              depositAmount = amount;
+            } else if (amount < 0) {
+              withdrawalAmount = Math.abs(amount);
+            }
+          }
+
+          // Only process rows with valid data
+          if (date && description && (withdrawalAmount > 0 || depositAmount > 0)) {
             transactions.push({
               rowIndex: i,
-              narration: row[1] || '',
+              date: date,
+              narration: description,
               withdrawal: withdrawalAmount,
               deposit: depositAmount,
               amount: withdrawalAmount > 0 ? withdrawalAmount : depositAmount,
@@ -312,42 +401,40 @@ const BankStatementCategorizer = () => {
       for (let i = headerRow + 1; i < jsonData.length; i++) {
         if (jsonData[i] && jsonData[i].length > 0) {
           const row = [...jsonData[i]];
-          const withdrawalAmount = row[4] ? parseFloat(row[4]) : 0;
-          const depositAmount = row[5] ? parseFloat(row[5]) : 0;
 
           // Find this transaction in our processed list
           const processedTxn = transactions.find(t => t.rowIndex === i);
           let category = '';
 
-          if (processedTxn && processedTxn.isRefund) {
-            // Use refund category for both payment and refund
-            category = processedTxn.refundCategory;
-          } else if (withdrawalAmount > 0) {
-            // Regular withdrawal
-            category = categorizeTransaction(row[1] || '', withdrawalAmount);
-            withdrawalCount++;
-          } else if (depositAmount > 0) {
-            // Regular deposit
-            category = categorizeTransaction(row[1] || '', depositAmount);
-            if (category === 'Stock Dividend Income' || category === 'Salary' || category === 'Saving Interest' ||
-                category === 'Self Transfer From Axis' || category === 'Om Marketing Transfer' || category === 'Refund' ||
-                category === 'Stock Market Transfer Refund' || category === 'Food Refund' || category === 'Apple Refund' ||
-                category === 'Entertainment' || category === 'Shopping') {
-              depositCount++;
-            } else {
-              category = ''; // Don't categorize regular deposits
+          if (processedTxn) {
+            if (processedTxn.isRefund) {
+              // Use refund category for both payment and refund
+              category = processedTxn.refundCategory;
+            } else if (processedTxn.withdrawal > 0) {
+              // Regular withdrawal
+              category = categorizeTransaction(processedTxn.narration, processedTxn.withdrawal);
+              withdrawalCount++;
+            } else if (processedTxn.deposit > 0) {
+              // Regular deposit
+              category = categorizeTransaction(processedTxn.narration, processedTxn.deposit);
+              if (category === 'Stock Dividend Income' || category === 'Salary' || category === 'Saving Interest' ||
+                  category === 'Self Transfer From Axis' || category === 'Om Marketing Transfer' || category === 'Refund' ||
+                  category === 'Stock Market Transfer Refund' || category === 'Food Refund' || category === 'Apple Refund' ||
+                  category === 'Entertainment' || category === 'Shopping') {
+                depositCount++;
+              } else {
+                category = ''; // Don't categorize regular deposits
+              }
             }
-          }
 
-          if (category) {
-            categoryStats[category] = (categoryStats[category] || 0) + 1;
-            if (withdrawalAmount > 0 || depositAmount > 0) {
+            if (category) {
+              categoryStats[category] = (categoryStats[category] || 0) + 1;
               withdrawalDetails.push({
-                date: row[0],
-                narration: row[1],
-                amount: withdrawalAmount || depositAmount,
+                date: processedTxn.date,
+                narration: processedTxn.narration,
+                amount: processedTxn.amount,
                 category: category,
-                type: withdrawalAmount > 0 ? 'withdrawal' : 'deposit'
+                type: processedTxn.withdrawal > 0 ? 'withdrawal' : 'deposit'
               });
             }
           }
